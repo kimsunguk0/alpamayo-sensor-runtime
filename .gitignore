@@ -1,0 +1,42 @@
+# Runtime datasets and recordings
+/datasample/
+*.mkv
+*.mp4
+*.h265
+*.h264
+*.parquet
+
+# Generated binaries and debug builds
+/alpamayo_raw_recorder
+/alpamayo_sensor_container
+/alpamayo_sensor_container_asan
+/alpamayo_sensor_container_dbg
+/alpamayo_raw_recorder.bak_*
+/alpamayo_sensor_container.bak_*
+/cam0_capture
+/cam_imu_pack
+/multicam_capture
+/set_ctrls_multi
+/sync
+/sensor_container/test_nvmm_appsink
+/sensor_container/test_nvmm_surface_map
+/build/
+
+# Logs and temporary outputs
+*.log
+*.tmp
+*.bak
+*.bak_*
+
+# Python local state
+__pycache__/
+*.py[cod]
+.venv*/
+
+# Editor/OS noise
+.DS_Store
+.vscode/
+.idea/
+
+# Local legacy scratch files
+/legacy/

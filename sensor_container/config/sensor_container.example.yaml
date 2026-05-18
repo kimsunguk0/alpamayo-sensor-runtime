@@ -1,0 +1,29 @@
+bind_host: 0.0.0.0
+bind_port: 18080
+clip_id: bringup_run
+vehicle_id: thor_vehicle_01
+imu_dev: /dev/ttyUSB0
+imu_baud: 115200
+camera_backend: v4l2
+pixel_format: UYVY
+camera_width: 1920
+camera_height: 1080
+camera_fps: 30
+planner_ingest_fps: 15
+planner_width: 576
+planner_height: 320
+fixed_delta_seconds: 0.1
+camera_target_mismatch_us: 50000
+localization_stale_us: 100000
+camera_state_skew_us: 50000
+allow_poseless_test_mode: false
+camera_names:
+  - left
+  - front
+  - right
+  - front_tele
+camera_devices:
+  - /dev/video2
+  - /dev/video5
+  - /dev/video0
+  - /dev/video4

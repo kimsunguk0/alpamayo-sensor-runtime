@@ -1,0 +1,102 @@
+output_root: /workspace/datasample
+session_id: "2026-05-14-test1"
+vehicle_id: test_car_01
+timezone: UTC
+
+duration_sec: 0
+chunk_sec: 60
+
+camera_fps: 30
+camera_width: 3840
+camera_height: 2160
+camera_bitrate: 80000000
+camera_container: mkv
+camera_codec: h265
+
+imu_dev: "/dev/ttyUSB0"
+sensor_dump: ""
+imu_baud: 115200
+imu_hz: 100
+gnss_hz: 10
+
+finalize_spool: true
+cleanup_spool: false
+validate: false
+
+camera_devices:
+  - /dev/video0
+  - /dev/video3
+  - /dev/video2
+  - /dev/video1
+  
+# Reference
+# This file is auto-loaded when you run:
+#   /workspace/build/bin/alpamayo_raw_recorder
+#
+# Camera order is fixed as:
+#   1. front
+#   2. front_tele
+#   3. left
+#   4. right
+#
+# Recommended starting point for ViT training-data capture:
+#   camera_bitrate: 80000000
+# Increase to 120000000 if you want to preserve more detail and storage allows it.
+#
+# output_root:
+#   Root directory where session folders are created.
+#
+# session_id:
+#   Leave empty to auto-generate a timestamped session folder name.
+#   Example manual value: "2025_03_A"
+#
+# vehicle_id, timezone:
+#   Optional metadata written into session_meta.json.
+#
+# duration_sec:
+#   Recording duration in seconds.
+#   Set to 0 to keep recording until Ctrl+C.
+#
+# chunk_sec:
+#   Length of each video chunk in seconds.
+#
+# camera_fps, camera_width, camera_height:
+#   Camera capture settings shared by all cameras.
+#
+# camera_bitrate:
+#   Per-camera encoder bitrate in bits/sec.
+#   80000000 = 80 Mbps per camera.
+#
+# camera_container:
+#   Saved camera chunk container. Use mkv or mp4.
+#
+# camera_codec:
+#   Encoder codec. Use h265 or h264.
+#
+# imu_dev:
+#   IMU/GNSS live serial device path.
+#   Leave empty if you use sensor_dump instead.
+#
+# sensor_dump:
+#   Replay IMU/GNSS from a dump CSV instead of live serial.
+#   Leave empty if you use imu_dev instead.
+#
+# imu_baud:
+#   Serial baud rate for imu_dev.
+#
+# imu_hz, gnss_hz:
+#   Metadata values written into session files.
+#
+# finalize_spool:
+#   Run parquet/sample-index conversion after recording.
+#
+# cleanup_spool:
+#   Remove raw CSV spool after finalize.
+#   Keep this false if you want both CSV and parquet to remain.
+#
+# validate:
+#   Decode saved chunks after recording and compare against frames.csv.
+#   Useful for validation, but slower.
+#
+# camera_devices:
+#   Device paths in fixed order: front, front_tele, left, right.
