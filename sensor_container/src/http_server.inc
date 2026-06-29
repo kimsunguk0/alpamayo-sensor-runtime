@@ -97,7 +97,7 @@ class HttpServer {
          << ",\"fps\":" << std::fixed << std::setprecision(2) << cam->fps_estimate()
          << ",\"latest_utc_us\":" << cam->latest_utc_us() << "}";
     }
-    os << "],\"latest_store\":" << latest_store_->health_json() << "}";
+    os << "],\"latest_store\":" << latest_store_->health_json(cfg_.debug_diagnostics_enabled) << "}";
     return os.str();
   }
 
@@ -133,6 +133,40 @@ class HttpServer {
           {"X-Clip-ID", sample.clip_id},
           {"X-Sample-Valid", "1"},
       };
+      if (cfg_.debug_diagnostics_enabled) {
+        const uint64_t now_us = now_utc_us_for_diagnostics();
+        headers.push_back({"X-Debug-Diagnostics", "1"});
+        headers.push_back({"X-Now-US", std::to_string(now_us)});
+        headers.push_back({"X-Latest-Camera-UTC-US", std::to_string(sample.latest_camera_utc_us)});
+        headers.push_back({"X-Latest-Camera-Pushed-Wall-US", std::to_string(sample.latest_camera_pushed_wall_us)});
+        headers.push_back({"X-Latest-Camera-Pushed-Minus-UTC-US", std::to_string(signed_delta_us(sample.latest_camera_pushed_wall_us, sample.latest_camera_utc_us))});
+        headers.push_back({"X-Latest-Pose-US", std::to_string(sample.latest_pose_us)});
+        headers.push_back({"X-Latest-Pose-Received-Wall-US", std::to_string(sample.latest_pose_received_wall_us)});
+        headers.push_back({"X-Latest-Pose-Pushed-Wall-US", std::to_string(sample.latest_pose_pushed_wall_us)});
+        headers.push_back({"X-Latest-Pose-Received-Minus-UTC-US", std::to_string(signed_delta_us(sample.latest_pose_received_wall_us, sample.latest_pose_us))});
+        headers.push_back({"X-Latest-Pose-Pushed-Minus-UTC-US", std::to_string(signed_delta_us(sample.latest_pose_pushed_wall_us, sample.latest_pose_us))});
+        headers.push_back({"X-Latest-Orientation-US", std::to_string(sample.latest_orientation_us)});
+        headers.push_back({"X-Latest-Orientation-Received-Wall-US", std::to_string(sample.latest_orientation_received_wall_us)});
+        headers.push_back({"X-Latest-Orientation-Pushed-Wall-US", std::to_string(sample.latest_orientation_pushed_wall_us)});
+        headers.push_back({"X-Latest-Orientation-Received-Minus-UTC-US", std::to_string(signed_delta_us(sample.latest_orientation_received_wall_us, sample.latest_orientation_us))});
+        headers.push_back({"X-Latest-Orientation-Pushed-Minus-UTC-US", std::to_string(signed_delta_us(sample.latest_orientation_pushed_wall_us, sample.latest_orientation_us))});
+        headers.push_back({"X-Newest-Possible-US", std::to_string(sample.newest_possible_us)});
+        headers.push_back({"X-Newest-Possible-Minus-T0-US", std::to_string(signed_delta_us(sample.newest_possible_us, sample.t0_us))});
+        headers.push_back({"X-Now-Minus-T0-US", std::to_string(signed_delta_us(now_us, sample.t0_us))});
+        headers.push_back({"X-Now-Minus-Latest-Camera-UTC-US", std::to_string(signed_delta_us(now_us, sample.latest_camera_utc_us))});
+        headers.push_back({"X-Now-Minus-Sample-Built-US", std::to_string(signed_delta_us(now_us, sample.sample_built_at_us))});
+        headers.push_back({"X-Now-Minus-Sample-Published-US", std::to_string(signed_delta_us(now_us, sample.sample_published_at_us))});
+        headers.push_back({"X-Sample-Build-Started-At-US", std::to_string(sample.sample_build_started_at_us)});
+        headers.push_back({"X-Sample-Build-Started-Minus-T0-US", std::to_string(signed_delta_us(sample.sample_build_started_at_us, sample.t0_us))});
+        headers.push_back({"X-Sample-Build-Started-Minus-Newest-Possible-US", std::to_string(signed_delta_us(sample.sample_build_started_at_us, sample.newest_possible_us))});
+        headers.push_back({"X-Sample-Built-At-US", std::to_string(sample.sample_built_at_us)});
+        headers.push_back({"X-Sample-Published-At-US", std::to_string(sample.sample_published_at_us)});
+        headers.push_back({"X-Sample-Built-Minus-T0-US", std::to_string(signed_delta_us(sample.sample_built_at_us, sample.t0_us))});
+        headers.push_back({"X-Sample-Published-Minus-T0-US", std::to_string(signed_delta_us(sample.sample_published_at_us, sample.t0_us))});
+        headers.push_back({"X-Pose-T0-Err-US", std::to_string(sample.pose_t0_err_us)});
+        headers.push_back({"X-Orientation-T0-Err-US", std::to_string(sample.orientation_t0_err_us)});
+        headers.push_back({"X-Camera-State-Skew-US", std::to_string(sample.camera_state_skew_us)});
+      }
       send_all(client_fd, make_response("200 OK", "application/octet-stream", sample.npz_bytes, headers));
       return;
     }

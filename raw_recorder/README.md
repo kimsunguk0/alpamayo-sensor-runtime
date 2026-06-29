@@ -37,3 +37,7 @@ Or explicitly:
 ```
 
 Recordings are written under `/workspace/datasample/<session_id>/` by default.
+
+## Config Notes
+
+`camera_fps` controls the camera capture mode. `record_fps` controls the saved video frame rate after optional in-pipeline frame dropping, so the recorder can negotiate 4K30 with the camera while saving 4K15 chunks.

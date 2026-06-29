@@ -17,6 +17,7 @@ extern "C" {
 #include <cmath>
 #include <condition_variable>
 #include <csignal>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -597,6 +598,10 @@ struct SensorContainerConfig {
   double gnss_antenna_to_ego_y_m = 0.0;
   double gnss_antenna_to_ego_z_m = 0.0;
   bool allow_poseless_test_mode = false;
+  bool debug_diagnostics_enabled = false;
+  bool yaw_heading_log_enabled = false;
+  fs::path yaw_heading_log_dir = "/workspace/yaw_heading_logs";
+  double yaw_heading_min_speed_mps = 0.2;
   uint64_t camera_target_mismatch_us = 50000;
   uint64_t localization_stale_us = 100000;
   uint64_t camera_state_skew_us = 50000;
@@ -672,6 +677,7 @@ static bool load_yaml_config(const fs::path& path, SensorContainerConfig& cfg, s
   if (auto v = get_scalar("clip_id")) cfg.clip_id = *v;
   if (auto v = get_scalar("vehicle_id")) cfg.vehicle_id = *v;
   if (auto v = get_scalar("imu_dev")) cfg.imu_dev = *v;
+  if (auto v = get_scalar("yaw_heading_log_dir")) cfg.yaw_heading_log_dir = *v;
   if (auto v = get_scalar("camera_backend")) {
     for (auto& cam : cfg.cameras) cam.backend = to_lower_copy(*v);
   }
@@ -689,6 +695,9 @@ static bool load_yaml_config(const fs::path& path, SensorContainerConfig& cfg, s
   if (!assign_u64("camera_state_skew_us", cfg.camera_state_skew_us, 1)) return false;
   if (!assign_double("fixed_delta_seconds", cfg.fixed_delta_seconds, 0.001)) return false;
   if (!assign_bool("allow_poseless_test_mode", cfg.allow_poseless_test_mode)) return false;
+  if (!assign_bool("debug_diagnostics_enabled", cfg.debug_diagnostics_enabled)) return false;
+  if (!assign_bool("yaw_heading_log_enabled", cfg.yaw_heading_log_enabled)) return false;
+  if (!assign_double("yaw_heading_min_speed_mps", cfg.yaw_heading_min_speed_mps, 0.0)) return false;
 
   int planner_width = cfg.cameras.empty() ? 576 : cfg.cameras.front().planner_width;
   int planner_height = cfg.cameras.empty() ? 320 : cfg.cameras.front().planner_height;
@@ -793,6 +802,7 @@ struct ImageFrame {
   uint64_t seq = 0;
   uint64_t master_ns = 0;
   uint64_t utc_us = 0;
+  uint64_t pushed_wall_us = 0;
   int width = 0;
   int height = 0;
   int stride = 0;
@@ -809,6 +819,7 @@ class FrameRing {
 
   void push(ImageFrame frame) {
     std::lock_guard<std::mutex> lk(m_);
+    frame.pushed_wall_us = now_realtime_ns() / 1000ULL;
     frames_.push_back(std::move(frame));
     while (frames_.size() > max_frames_) frames_.pop_front();
   }
@@ -835,6 +846,14 @@ class FrameRing {
     return frames_.empty() ? 0 : frames_.back().utc_us;
   }
 
+  bool latest_timing(uint64_t& utc_us, uint64_t& pushed_wall_us) const {
+    std::lock_guard<std::mutex> lk(m_);
+    if (frames_.empty()) return false;
+    utc_us = frames_.back().utc_us;
+    pushed_wall_us = frames_.back().pushed_wall_us;
+    return true;
+  }
+
   uint64_t latest_seq() const {
     std::lock_guard<std::mutex> lk(m_);
     return frames_.empty() ? 0 : frames_.back().seq;
@@ -858,6 +877,8 @@ class FrameRing {
 
 struct OrientationSample {
   uint64_t utc_us = 0;
+  uint64_t received_wall_us = 0;
+  uint64_t pushed_wall_us = 0;
   double roll_deg = 0.0;
   double pitch_deg = 0.0;
   double yaw_deg = 0.0;
@@ -866,12 +887,25 @@ struct OrientationSample {
 
 struct PoseSample {
   uint64_t utc_us = 0;
+  uint64_t received_wall_us = 0;
+  uint64_t pushed_wall_us = 0;
   std::array<double, 3> enu_xyz{0.0, 0.0, 0.0};
+  std::array<double, 3> vel_enu_mps{0.0, 0.0, 0.0};
+  bool velocity_valid = false;
+  std::array<double, 3> utm_xyz{0.0, 0.0, 0.0};
+  int utm_zone = 0;
+  bool utm_northp = true;
   std::array<double, 9> world_from_ego{
       1.0, 0.0, 0.0,
       0.0, 1.0, 0.0,
       0.0, 0.0, 1.0,
   };
+  std::array<double, 9> covariance_enu_m2{
+      0.0, 0.0, 0.0,
+      0.0, 0.0, 0.0,
+      0.0, 0.0, 0.0,
+  };
+  bool covariance_valid = false;
   std::array<double, 3> lla{0.0, 0.0, 0.0};
   uint16_t pc = 0;
 };
@@ -882,13 +916,213 @@ static double wrap_angle_deg(double angle_deg) {
   return out - 180.0;
 }
 
+static double wrap_compass_deg(double angle_deg) {
+  double out = std::fmod(angle_deg, 360.0);
+  if (out < 0.0) out += 360.0;
+  return out;
+}
+
+static double speed_2d_mps(const std::array<double, 3>& vel_enu_mps) {
+  return std::hypot(vel_enu_mps[0], vel_enu_mps[1]);
+}
+
+static std::optional<double> heading_yaw_deg_from_velocity(
+    const std::array<double, 3>& vel_enu_mps,
+    double min_speed_mps) {
+  if (!std::isfinite(vel_enu_mps[0]) || !std::isfinite(vel_enu_mps[1])) return std::nullopt;
+  if (speed_2d_mps(vel_enu_mps) < min_speed_mps) return std::nullopt;
+  return wrap_angle_deg(std::atan2(vel_enu_mps[1], vel_enu_mps[0]) * 180.0 / M_PI);
+}
+
+static double compass_heading_deg_from_yaw(double yaw_deg) {
+  return wrap_compass_deg(90.0 - yaw_deg);
+}
+
+class YawHeadingCsvLogger {
+ public:
+  ~YawHeadingCsvLogger() { close(); }
+
+  bool open(const fs::path& dir, const std::string& clip_id, double min_speed_mps, std::string& error) {
+    std::lock_guard<std::mutex> lk(m_);
+    close_locked();
+    min_speed_mps_ = min_speed_mps;
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) {
+      error = "failed to create yaw/heading log dir " + dir.string() + ": " + ec.message();
+      return false;
+    }
+
+    const std::string base = safe_filename(clip_id.empty() ? "run" : clip_id);
+    sensor_path_ = dir / (base + "_sensor_yaw_heading.csv");
+    planner_path_ = dir / (base + "_planner_yaw_heading_10hz.csv");
+
+    sensor_csv_.open(sensor_path_, std::ios::out | std::ios::trunc);
+    if (!sensor_csv_) {
+      error = "failed to open " + sensor_path_.string();
+      close_locked();
+      return false;
+    }
+    planner_csv_.open(planner_path_, std::ios::out | std::ios::trunc);
+    if (!planner_csv_) {
+      error = "failed to open " + planner_path_.string();
+      close_locked();
+      return false;
+    }
+
+    sensor_csv_
+        << "utc_us,master_ns,yaw_valid,yaw_deg,velocity_valid,"
+        << "vel_e_mps,vel_n_mps,vel_u_mps,speed_2d_mps,"
+        << "heading_valid,heading_yaw_deg,heading_compass_deg,yaw_minus_heading_deg,"
+        << "fix_type,num_sv,utc_valid\n";
+    planner_csv_
+        << "seq,t0_us,yaw_valid,yaw_deg,heading_valid,"
+        << "vel_e_mps,vel_n_mps,vel_u_mps,speed_2d_mps,"
+        << "heading_yaw_deg,heading_compass_deg,yaw_minus_heading_deg,"
+        << "pose_t0_err_us,orientation_t0_err_us,camera_state_skew_us\n";
+    enabled_ = true;
+    return true;
+  }
+
+  void close() {
+    std::lock_guard<std::mutex> lk(m_);
+    close_locked();
+  }
+
+  bool enabled() const {
+    std::lock_guard<std::mutex> lk(m_);
+    return enabled_;
+  }
+
+  fs::path sensor_path() const {
+    std::lock_guard<std::mutex> lk(m_);
+    return sensor_path_;
+  }
+
+  fs::path planner_path() const {
+    std::lock_guard<std::mutex> lk(m_);
+    return planner_path_;
+  }
+
+  void log_sensor(uint64_t utc_us, uint64_t master_ns,
+                  bool yaw_valid, double yaw_deg,
+                  const std::optional<std::array<double, 3>>& vel_enu_mps,
+                  int fix_type, int num_sv, uint8_t utc_valid) {
+    std::lock_guard<std::mutex> lk(m_);
+    if (!enabled_ || !sensor_csv_) return;
+    const bool velocity_valid = vel_enu_mps.has_value();
+    const std::optional<double> heading_yaw =
+        velocity_valid ? heading_yaw_deg_from_velocity(*vel_enu_mps, min_speed_mps_) : std::nullopt;
+    write_common_prefix(sensor_csv_, utc_us, master_ns, yaw_valid, yaw_deg, velocity_valid, vel_enu_mps);
+    sensor_csv_ << (heading_yaw ? 1 : 0) << ',';
+    write_heading_fields(sensor_csv_, yaw_valid, yaw_deg, heading_yaw);
+    sensor_csv_ << ',' << fix_type << ',' << num_sv << ',' << int(utc_valid) << '\n';
+    sensor_csv_.flush();
+  }
+
+  void log_planner(uint64_t seq, uint64_t t0_us,
+                   bool yaw_valid, double yaw_deg,
+                   bool velocity_valid, const std::array<double, 3>& vel_enu_mps,
+                   uint64_t pose_t0_err_us, uint64_t orientation_t0_err_us,
+                   uint64_t camera_state_skew_us) {
+    std::lock_guard<std::mutex> lk(m_);
+    if (!enabled_ || !planner_csv_) return;
+    const std::optional<std::array<double, 3>> maybe_vel = velocity_valid
+        ? std::optional<std::array<double, 3>>(vel_enu_mps)
+        : std::nullopt;
+    const std::optional<double> heading_yaw =
+        velocity_valid ? heading_yaw_deg_from_velocity(vel_enu_mps, min_speed_mps_) : std::nullopt;
+    planner_csv_ << seq << ',' << t0_us << ',' << (yaw_valid ? 1 : 0) << ',';
+    write_optional_double(planner_csv_, yaw_valid ? std::optional<double>(yaw_deg) : std::nullopt);
+    planner_csv_ << ',' << (heading_yaw ? 1 : 0) << ',';
+    write_velocity_fields(planner_csv_, velocity_valid, maybe_vel);
+    planner_csv_ << ',';
+    write_heading_fields(planner_csv_, yaw_valid, yaw_deg, heading_yaw);
+    planner_csv_ << ',' << pose_t0_err_us
+                 << ',' << orientation_t0_err_us
+                 << ',' << camera_state_skew_us << '\n';
+    planner_csv_.flush();
+  }
+
+ private:
+  static std::string safe_filename(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    for (unsigned char ch : text) {
+      if (std::isalnum(ch) || ch == '_' || ch == '-' || ch == '.') {
+        out.push_back(static_cast<char>(ch));
+      } else {
+        out.push_back('_');
+      }
+    }
+    return out.empty() ? "run" : out;
+  }
+
+  static void write_optional_double(std::ostream& os, std::optional<double> value) {
+    if (!value || !std::isfinite(*value)) return;
+    os << std::fixed << std::setprecision(9) << *value;
+  }
+
+  static void write_velocity_fields(std::ostream& os, bool velocity_valid,
+                                    const std::optional<std::array<double, 3>>& vel_enu_mps) {
+    if (velocity_valid && vel_enu_mps) {
+      write_optional_double(os, (*vel_enu_mps)[0]);
+      os << ',';
+      write_optional_double(os, (*vel_enu_mps)[1]);
+      os << ',';
+      write_optional_double(os, (*vel_enu_mps)[2]);
+      os << ',';
+      write_optional_double(os, speed_2d_mps(*vel_enu_mps));
+      return;
+    }
+    os << ",,,";
+  }
+
+  static void write_heading_fields(std::ostream& os, bool yaw_valid, double yaw_deg,
+                                   std::optional<double> heading_yaw_deg) {
+    write_optional_double(os, heading_yaw_deg);
+    os << ',';
+    if (heading_yaw_deg) write_optional_double(os, compass_heading_deg_from_yaw(*heading_yaw_deg));
+    os << ',';
+    if (yaw_valid && heading_yaw_deg) write_optional_double(os, wrap_angle_deg(yaw_deg - *heading_yaw_deg));
+  }
+
+  static void write_common_prefix(std::ostream& os, uint64_t utc_us, uint64_t master_ns,
+                                  bool yaw_valid, double yaw_deg,
+                                  bool velocity_valid,
+                                  const std::optional<std::array<double, 3>>& vel_enu_mps) {
+    os << utc_us << ',' << master_ns << ',' << (yaw_valid ? 1 : 0) << ',';
+    write_optional_double(os, yaw_valid ? std::optional<double>(yaw_deg) : std::nullopt);
+    os << ',' << (velocity_valid ? 1 : 0) << ',';
+    write_velocity_fields(os, velocity_valid, vel_enu_mps);
+    os << ',';
+  }
+
+  void close_locked() {
+    if (sensor_csv_.is_open()) sensor_csv_.close();
+    if (planner_csv_.is_open()) planner_csv_.close();
+    enabled_ = false;
+  }
+
+  mutable std::mutex m_;
+  std::ofstream sensor_csv_;
+  std::ofstream planner_csv_;
+  fs::path sensor_path_;
+  fs::path planner_path_;
+  double min_speed_mps_{0.2};
+  bool enabled_{false};
+};
+
 class OrientationRing {
  public:
   explicit OrientationRing(size_t max_samples = 4096) : max_samples_(max_samples) {}
 
   void push(const OrientationSample& sample) {
     std::lock_guard<std::mutex> lk(m_);
-    samples_.push_back(sample);
+    OrientationSample pushed = sample;
+    pushed.pushed_wall_us = now_realtime_ns() / 1000ULL;
+    if (pushed.received_wall_us == 0) pushed.received_wall_us = pushed.pushed_wall_us;
+    samples_.push_back(pushed);
     while (samples_.size() > max_samples_) samples_.pop_front();
   }
 
@@ -942,6 +1176,8 @@ class OrientationRing {
     const double alpha = static_cast<double>(target_utc_us - a.utc_us) / static_cast<double>(span_us);
 
     out.utc_us = target_utc_us;
+    out.received_wall_us = (alpha < 0.5) ? a.received_wall_us : b.received_wall_us;
+    out.pushed_wall_us = (alpha < 0.5) ? a.pushed_wall_us : b.pushed_wall_us;
     out.pc = (alpha < 0.5) ? a.pc : b.pc;
     out.roll_deg = a.roll_deg + (b.roll_deg - a.roll_deg) * alpha;
     out.pitch_deg = a.pitch_deg + (b.pitch_deg - a.pitch_deg) * alpha;
@@ -954,6 +1190,15 @@ class OrientationRing {
   uint64_t latest_utc_us() const {
     std::lock_guard<std::mutex> lk(m_);
     return samples_.empty() ? 0 : samples_.back().utc_us;
+  }
+
+  bool latest_timing(uint64_t& utc_us, uint64_t& received_wall_us, uint64_t& pushed_wall_us) const {
+    std::lock_guard<std::mutex> lk(m_);
+    if (samples_.empty()) return false;
+    utc_us = samples_.back().utc_us;
+    received_wall_us = samples_.back().received_wall_us;
+    pushed_wall_us = samples_.back().pushed_wall_us;
+    return true;
   }
 
   size_t size() const {
@@ -973,7 +1218,10 @@ class PoseRing {
 
   void push(const PoseSample& sample) {
     std::lock_guard<std::mutex> lk(m_);
-    samples_.push_back(sample);
+    PoseSample pushed = sample;
+    pushed.pushed_wall_us = now_realtime_ns() / 1000ULL;
+    if (pushed.received_wall_us == 0) pushed.received_wall_us = pushed.pushed_wall_us;
+    samples_.push_back(pushed);
     while (samples_.size() > max_samples_) samples_.pop_front();
   }
 
@@ -1028,10 +1276,55 @@ class PoseRing {
 
     out = a;
     out.utc_us = target_utc_us;
+    out.received_wall_us = (alpha < 0.5) ? a.received_wall_us : b.received_wall_us;
+    out.pushed_wall_us = (alpha < 0.5) ? a.pushed_wall_us : b.pushed_wall_us;
     out.pc = (alpha < 0.5) ? a.pc : b.pc;
     for (int i = 0; i < 3; ++i) {
       out.enu_xyz[i] = a.enu_xyz[i] + (b.enu_xyz[i] - a.enu_xyz[i]) * alpha;
+      out.utm_xyz[i] = a.utm_xyz[i] + (b.utm_xyz[i] - a.utm_xyz[i]) * alpha;
       out.lla[i] = a.lla[i] + (b.lla[i] - a.lla[i]) * alpha;
+    }
+    if (a.velocity_valid && b.velocity_valid) {
+      out.velocity_valid = true;
+      for (int i = 0; i < 3; ++i) {
+        out.vel_enu_mps[i] = a.vel_enu_mps[i] + (b.vel_enu_mps[i] - a.vel_enu_mps[i]) * alpha;
+      }
+    } else if (a.velocity_valid || b.velocity_valid) {
+      const PoseSample& vel_source = (alpha < 0.5) ? a : b;
+      if (vel_source.velocity_valid) {
+        out.velocity_valid = true;
+        out.vel_enu_mps = vel_source.vel_enu_mps;
+      } else {
+        out.velocity_valid = false;
+        out.vel_enu_mps = {0.0, 0.0, 0.0};
+      }
+    } else {
+      out.velocity_valid = false;
+      out.vel_enu_mps = {0.0, 0.0, 0.0};
+    }
+    if (a.utm_zone == b.utm_zone && a.utm_northp == b.utm_northp) {
+      out.utm_zone = a.utm_zone;
+      out.utm_northp = a.utm_northp;
+    } else {
+      out.utm_zone = (alpha < 0.5) ? a.utm_zone : b.utm_zone;
+      out.utm_northp = (alpha < 0.5) ? a.utm_northp : b.utm_northp;
+      out.utm_xyz = (alpha < 0.5) ? a.utm_xyz : b.utm_xyz;
+    }
+    if (a.covariance_valid && b.covariance_valid) {
+      out.covariance_valid = true;
+      for (int i = 0; i < 9; ++i) {
+        out.covariance_enu_m2[i] = a.covariance_enu_m2[i] + (b.covariance_enu_m2[i] - a.covariance_enu_m2[i]) * alpha;
+      }
+    } else if (a.covariance_valid || b.covariance_valid) {
+      const PoseSample& cov_source = (alpha < 0.5) ? a : b;
+      if (cov_source.covariance_valid) {
+        out.covariance_valid = true;
+        out.covariance_enu_m2 = cov_source.covariance_enu_m2;
+      } else {
+        out.covariance_valid = false;
+      }
+    } else {
+      out.covariance_valid = false;
     }
     support_err_us = std::max<uint64_t>(target_utc_us - a.utc_us, b.utc_us - target_utc_us);
     return true;
@@ -1040,6 +1333,15 @@ class PoseRing {
   uint64_t latest_utc_us() const {
     std::lock_guard<std::mutex> lk(m_);
     return samples_.empty() ? 0 : samples_.back().utc_us;
+  }
+
+  bool latest_timing(uint64_t& utc_us, uint64_t& received_wall_us, uint64_t& pushed_wall_us) const {
+    std::lock_guard<std::mutex> lk(m_);
+    if (samples_.empty()) return false;
+    utc_us = samples_.back().utc_us;
+    received_wall_us = samples_.back().received_wall_us;
+    pushed_wall_us = samples_.back().pushed_wall_us;
+    return true;
   }
 
   size_t size() const {
@@ -1093,6 +1395,71 @@ static std::array<double, 3> ecef_to_enu(const std::array<double, 3>& ecef_xyz,
       -sin_lat * cos_lon * dx - sin_lat * sin_lon * dy + cos_lat * dz,
       cos_lat * cos_lon * dx + cos_lat * sin_lon * dy + sin_lat * dz,
   };
+}
+
+struct UtmCoord {
+  double easting_m = 0.0;
+  double northing_m = 0.0;
+  int zone = 0;
+  bool northp = true;
+};
+
+static bool lla_to_utm(double lat_deg, double lon_deg, UtmCoord& out) {
+  if (!std::isfinite(lat_deg) || !std::isfinite(lon_deg) ||
+      lat_deg < -80.0 || lat_deg > 84.0 ||
+      lon_deg < -180.0 || lon_deg > 180.0) {
+    return false;
+  }
+
+  constexpr double a = 6378137.0;
+  constexpr double f = 1.0 / 298.257223563;
+  constexpr double k0 = 0.9996;
+  const double e2 = f * (2.0 - f);
+  const double ep2 = e2 / (1.0 - e2);
+
+  int zone = static_cast<int>(std::floor((lon_deg + 180.0) / 6.0)) + 1;
+  if (zone < 1) zone = 1;
+  if (zone > 60) zone = 60;
+
+  // Standard UTM special zones for Norway and Svalbard.
+  if (lat_deg >= 56.0 && lat_deg < 64.0 && lon_deg >= 3.0 && lon_deg < 12.0) zone = 32;
+  if (lat_deg >= 72.0 && lat_deg < 84.0) {
+    if (lon_deg >= 0.0 && lon_deg < 9.0) zone = 31;
+    else if (lon_deg >= 9.0 && lon_deg < 21.0) zone = 33;
+    else if (lon_deg >= 21.0 && lon_deg < 33.0) zone = 35;
+    else if (lon_deg >= 33.0 && lon_deg < 42.0) zone = 37;
+  }
+
+  const double lat = lat_deg * M_PI / 180.0;
+  const double lon = lon_deg * M_PI / 180.0;
+  const double lon0 = ((static_cast<double>(zone) - 1.0) * 6.0 - 180.0 + 3.0) * M_PI / 180.0;
+
+  const double sin_lat = std::sin(lat);
+  const double cos_lat = std::cos(lat);
+  const double tan_lat = std::tan(lat);
+  const double N = a / std::sqrt(1.0 - e2 * sin_lat * sin_lat);
+  const double T = tan_lat * tan_lat;
+  const double C = ep2 * cos_lat * cos_lat;
+  const double A = cos_lat * (lon - lon0);
+  const double M = a * ((1.0 - e2 / 4.0 - 3.0 * e2 * e2 / 64.0 - 5.0 * e2 * e2 * e2 / 256.0) * lat
+      - (3.0 * e2 / 8.0 + 3.0 * e2 * e2 / 32.0 + 45.0 * e2 * e2 * e2 / 1024.0) * std::sin(2.0 * lat)
+      + (15.0 * e2 * e2 / 256.0 + 45.0 * e2 * e2 * e2 / 1024.0) * std::sin(4.0 * lat)
+      - (35.0 * e2 * e2 * e2 / 3072.0) * std::sin(6.0 * lat));
+
+  const double easting = k0 * N * (A
+      + (1.0 - T + C) * A * A * A / 6.0
+      + (5.0 - 18.0 * T + T * T + 72.0 * C - 58.0 * ep2) * A * A * A * A * A / 120.0) + 500000.0;
+  double northing = k0 * (M + N * tan_lat * (A * A / 2.0
+      + (5.0 - T + 9.0 * C + 4.0 * C * C) * A * A * A * A / 24.0
+      + (61.0 - 58.0 * T + T * T + 600.0 * C - 330.0 * ep2) * A * A * A * A * A * A / 720.0));
+  const bool northp = lat_deg >= 0.0;
+  if (!northp) northing += 10000000.0;
+
+  out.easting_m = easting;
+  out.northing_m = northing;
+  out.zone = zone;
+  out.northp = northp;
+  return std::isfinite(out.easting_m) && std::isfinite(out.northing_m);
 }
 
 static std::array<double, 9> matmul33(const std::array<double, 9>& A, const std::array<double, 9>& B) {

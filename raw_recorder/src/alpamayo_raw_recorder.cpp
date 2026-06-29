@@ -554,6 +554,7 @@ struct CameraConfig {
   int width = 3840;
   int height = 2160;
   int fps = 30;
+  int record_fps = 30;
   int bitrate = 80000000;
   int chunk_sec = 60;
   std::string container = "mkv";
@@ -572,6 +573,7 @@ struct RecorderConfig {
   fs::path sensor_dump;
   int imu_baud = 115200;
   int camera_fps = 30;
+  int record_fps = 0;
   int camera_width = 3840;
   int camera_height = 2160;
   int camera_bitrate = 80000000;
@@ -587,6 +589,10 @@ struct RecorderConfig {
 };
 
 static void sync_camera_common_settings(RecorderConfig& cfg);
+
+static int effective_record_fps(const RecorderConfig& cfg) {
+  return cfg.record_fps > 0 ? cfg.record_fps : cfg.camera_fps;
+}
 
 static std::string camera_frames_header() {
   return "frame_id,chunk_id,frame_index_in_chunk,timestamp_utc_ns,timestamp_monotonic_ns,width,height,exposure_time_us,gain,dropped_frame,trigger_id,seq,flags,file_size_bytes,gst_pts_ns";
@@ -633,6 +639,7 @@ static std::string make_session_meta_json(const RecorderConfig& cfg) {
   }
   os << "  },\n";
   os << "  \"camera_fps\": " << cfg.camera_fps << ",\n";
+  os << "  \"camera_record_fps\": " << effective_record_fps(cfg) << ",\n";
   os << "  \"camera_chunk_backend\": \"gstreamer\",\n";
   os << "  \"camera_chunk_codec\": \"nvv4l2" << json_escape(cfg.camera_codec) << "\",\n";
   os << "  \"camera_container\": \"" << json_escape(cfg.camera_container) << "\",\n";
@@ -725,11 +732,17 @@ class CameraRecorder {
     pipeline
         << "v4l2src name=src device=" << cfg_.device << " io-mode=2 do-timestamp=false ! "
         << "video/x-raw,format=UYVY,width=" << cfg_.width << ",height=" << cfg_.height
-        << ",framerate=" << cfg_.fps << "/1 ! "
+        << ",framerate=" << cfg_.fps << "/1 ! ";
+    if (cfg_.record_fps > 0 && cfg_.record_fps < cfg_.fps) {
+      pipeline
+          << "videorate drop-only=true ! "
+          << "video/x-raw,framerate=" << cfg_.record_fps << "/1 ! ";
+    }
+    pipeline
         << "queue max-size-buffers=4 max-size-bytes=0 max-size-time=0 ! "
         << "nvvidconv ! video/x-raw(memory:NVMM),format=NV12 ! "
         << encoder << " bitrate=" << cfg_.bitrate
-        << " iframeinterval=" << cfg_.fps
+        << " iframeinterval=" << cfg_.record_fps
         << " control-rate=1 ! "
         << parser << " ! "
         << "identity name=idxprobe signal-handoffs=true silent=true ! "
@@ -907,7 +920,7 @@ class CameraRecorder {
 
   uint64_t recent_gap_count_locked() const {
     if (warmup_recent_pts_.size() < 2) return 0;
-    const uint64_t expected = static_cast<uint64_t>(1000000000ULL / std::max(1, cfg_.fps));
+    const uint64_t expected = static_cast<uint64_t>(1000000000ULL / std::max(1, cfg_.record_fps));
     uint64_t gaps = 0;
     for (size_t i = 1; i < warmup_recent_pts_.size(); ++i) {
       const uint64_t delta = warmup_recent_pts_[i] - warmup_recent_pts_[i - 1];
@@ -928,8 +941,8 @@ class CameraRecorder {
       if (!ready_.load() && warmup_frames >= 90 && warmup_recent_pts_.size() >= 60) {
         const double fps = recent_fps_locked();
         const uint64_t gaps = recent_gap_count_locked();
-        if (fps >= static_cast<double>(cfg_.fps) * 0.97 &&
-            fps <= static_cast<double>(cfg_.fps) * 1.03 &&
+        if (fps >= static_cast<double>(cfg_.record_fps) * 0.97 &&
+            fps <= static_cast<double>(cfg_.record_fps) * 1.03 &&
             gaps == 0 &&
             (now_master_ns() - warmup_start_master_ns_) >= 2000000000ULL) {
           ready_.store(true);
@@ -992,7 +1005,7 @@ class CameraRecorder {
     uint64_t frame_id = frame_count_.fetch_add(1);
     bool dropped_frame = false;
     if (last_pts_ns_ && pts_ns != GST_CLOCK_TIME_NONE) {
-      uint64_t expected = static_cast<uint64_t>(1000000000ULL / std::max(1, cfg_.fps));
+      uint64_t expected = static_cast<uint64_t>(1000000000ULL / std::max(1, cfg_.record_fps));
       uint64_t delta = pts_ns - *last_pts_ns_;
       if (delta > expected + expected / 2) {
         dropped_frame = true;
@@ -2538,10 +2551,10 @@ static ValidationResult validate_camera_session(const RecorderConfig& cfg, const
 static RecorderConfig default_config() {
   RecorderConfig cfg;
   cfg.cameras = {
-      {"front", "/dev/video2", 3840, 2160, 30, 80000000, 60, "mkv", "h265"},
-      {"front_tele", "/dev/video7", 3840, 2160, 30, 80000000, 60, "mkv", "h265"},
-      {"left", "/dev/video1", 3840, 2160, 30, 80000000, 60, "mkv", "h265"},
-      {"right", "/dev/video6", 3840, 2160, 30, 80000000, 60, "mkv", "h265"},
+      {"front", "/dev/video2", 3840, 2160, 30, 30, 80000000, 60, "mkv", "h265"},
+      {"front_tele", "/dev/video7", 3840, 2160, 30, 30, 80000000, 60, "mkv", "h265"},
+      {"left", "/dev/video1", 3840, 2160, 30, 30, 80000000, 60, "mkv", "h265"},
+      {"right", "/dev/video6", 3840, 2160, 30, 30, 80000000, 60, "mkv", "h265"},
   };
   sync_camera_common_settings(cfg);
   return cfg;
@@ -2563,6 +2576,7 @@ static void usage(const char* argv0) {
       << "  --chunk-sec N             default 60\n"
       << "  --container TYPE          default mkv (mkv|mp4)\n"
       << "  --bitrate N               default 80000000\n"
+      << "  --record-fps N            saved video fps; capture fps stays at config camera_fps\n"
       << "  --imu-dev PATH            default disabled\n"
       << "  --sensor-dump PATH        replay IMU/GNSS events from CSV dump\n"
       << "  --imu-baud N              default 115200\n"
@@ -2601,6 +2615,7 @@ static void sync_camera_common_settings(RecorderConfig& cfg) {
     cam.width = cfg.camera_width;
     cam.height = cfg.camera_height;
     cam.fps = cfg.camera_fps;
+    cam.record_fps = effective_record_fps(cfg);
     cam.bitrate = cfg.camera_bitrate;
     cam.chunk_sec = cfg.chunk_sec;
     cam.container = cfg.camera_container;
@@ -2617,6 +2632,7 @@ static bool parse_camera_arg(const std::string& arg, CameraConfig& out) {
   out.width = 3840;
   out.height = 2160;
   out.fps = 30;
+  out.record_fps = 30;
   out.bitrate = 80000000;
   out.chunk_sec = 60;
   out.container = "mkv";
@@ -2858,6 +2874,7 @@ static bool load_yaml_config(const fs::path& path, RecorderConfig& cfg, std::str
 
   if (!assign_int("imu_baud", cfg.imu_baud, 1)) return false;
   if (!assign_int("camera_fps", cfg.camera_fps, 1)) return false;
+  if (!assign_int("record_fps", cfg.record_fps, 1)) return false;
   if (!assign_int("camera_width", cfg.camera_width, 1)) return false;
   if (!assign_int("camera_height", cfg.camera_height, 1)) return false;
   if (!assign_int("bitrate", cfg.camera_bitrate, 1)) return false;
@@ -2903,6 +2920,10 @@ static bool load_yaml_config(const fs::path& path, RecorderConfig& cfg, std::str
   }
 
   sync_camera_common_settings(cfg);
+  if (effective_record_fps(cfg) > cfg.camera_fps) {
+    error = "record_fps cannot exceed camera_fps";
+    return false;
+  }
   cfg.config_path = path;
   cfg.config_loaded = true;
   return true;
@@ -2990,6 +3011,8 @@ int main(int argc, char** argv) {
       cfg.camera_container = container;
     } else if (a == "--bitrate" && i + 1 < argc) {
       cfg.camera_bitrate = std::atoi(argv[++i]);
+    } else if (a == "--record-fps" && i + 1 < argc) {
+      cfg.record_fps = std::max(1, std::atoi(argv[++i]));
     } else if (a == "--imu-dev" && i + 1 < argc) {
       cfg.imu_dev = argv[++i];
     } else if (a == "--sensor-dump" && i + 1 < argc) {
@@ -3058,6 +3081,10 @@ int main(int argc, char** argv) {
   }
 
   sync_camera_common_settings(cfg);
+  if (effective_record_fps(cfg) > cfg.camera_fps) {
+    log_error("record_fps cannot exceed camera_fps");
+    return 2;
+  }
 
   fs::path session_dir = cfg.output_root / cfg.session_id;
   fs::create_directories(session_dir / "sensors");
@@ -3209,7 +3236,8 @@ int main(int argc, char** argv) {
   std::cout << "Recording session: " << session_dir << "\n";
   for (const auto& cam : cfg.cameras) {
     std::cout << "  camera_" << cam.name << " -> " << cam.device
-              << " " << cam.width << "x" << cam.height << "@" << cam.fps
+              << " " << cam.width << "x" << cam.height << "@" << cam.record_fps
+              << " capture_fps=" << cam.fps
               << " bitrate=" << cam.bitrate << " chunk=" << cam.chunk_sec << "s\n";
   }
   if (!cfg.sensor_dump.empty()) {

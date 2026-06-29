@@ -157,8 +157,15 @@ class CameraSource {
 
   bool has_error() const { return has_error_.load(); }
   std::string error_message() const { return last_error_; }
+  void set_frame_callback(std::function<void()> callback) {
+    std::lock_guard<std::mutex> lk(callback_mu_);
+    frame_callback_ = std::move(callback);
+  }
   const FrameRing& ring() const { return ring_; }
   uint64_t latest_utc_us() const { return ring_.latest_utc_us(); }
+  bool latest_timing(uint64_t& utc_us, uint64_t& pushed_wall_us) const {
+    return ring_.latest_timing(utc_us, pushed_wall_us);
+  }
   uint64_t frame_count() const { return frame_count_.load(); }
   double fps_estimate() const {
     uint64_t elapsed_ns = now_master_ns() - start_master_ns_;
@@ -176,7 +183,16 @@ class CameraSource {
   struct MMapBuf {
     void* start = nullptr;
     size_t length = 0;
-  };
+	  };
+
+  void notify_frame_callback() {
+    std::function<void()> callback;
+    {
+      std::lock_guard<std::mutex> lk(callback_mu_);
+      callback = frame_callback_;
+    }
+    if (callback) callback();
+  }
 
   struct HeldBuffer {
     uint32_t index = 0;
@@ -469,6 +485,7 @@ class CameraSource {
         image_frame.data = static_cast<const uint8_t*>(bufs_[buf.index].start);
         image_frame.data_size = bytes_used;
         ring_.push(std::move(image_frame));
+        notify_frame_callback();
       }
     }
   }
@@ -666,6 +683,7 @@ class CameraSource {
     image_frame.data = image_frame.bytes ? image_frame.bytes->data() : nullptr;
     image_frame.data_size = image_frame.bytes ? image_frame.bytes->size() : 0;
     ring_.push(std::move(image_frame));
+    notify_frame_callback();
 
     gst_sample_unref(sample);
     return GST_FLOW_OK;
@@ -692,4 +710,6 @@ class CameraSource {
   std::atomic<bool> has_error_{false};
   std::string last_error_;
   uint64_t start_master_ns_{0};
+  std::mutex callback_mu_;
+  std::function<void()> frame_callback_;
 };

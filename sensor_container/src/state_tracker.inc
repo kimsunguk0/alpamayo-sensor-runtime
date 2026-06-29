@@ -1,8 +1,13 @@
 class StateTracker {
  public:
   StateTracker(const std::string& dev, int baud, UtcMapper* utc_mapper,
-               const std::array<double, 3>& gnss_antenna_to_ego_m = {0.0, 0.0, 0.0})
-      : dev_(dev), baud_(baud), utc_mapper_(utc_mapper), gnss_antenna_to_ego_m_(gnss_antenna_to_ego_m) {}
+               const std::array<double, 3>& gnss_antenna_to_ego_m = {0.0, 0.0, 0.0},
+               YawHeadingCsvLogger* yaw_heading_logger = nullptr)
+      : dev_(dev),
+        baud_(baud),
+        utc_mapper_(utc_mapper),
+        gnss_antenna_to_ego_m_(gnss_antenna_to_ego_m),
+        yaw_heading_logger_(yaw_heading_logger) {}
 
   ~StateTracker() { stop(); }
 
@@ -24,9 +29,19 @@ class StateTracker {
 
   bool has_error() const { return has_error_.load(); }
   std::string error_message() const { return error_message_; }
+  void set_data_callback(std::function<void()> callback) {
+    std::lock_guard<std::mutex> lk(callback_mu_);
+    data_callback_ = std::move(callback);
+  }
   bool imu_ready() const { return imu_count_.load() > 0; }
   bool pose_ready() const { return pose_ring_.size() > 0; }
   uint64_t latest_pose_utc_us() const { return pose_ring_.latest_utc_us(); }
+  bool latest_pose_timing(uint64_t& utc_us, uint64_t& received_wall_us, uint64_t& pushed_wall_us) const {
+    return pose_ring_.latest_timing(utc_us, received_wall_us, pushed_wall_us);
+  }
+  bool latest_orientation_timing(uint64_t& utc_us, uint64_t& received_wall_us, uint64_t& pushed_wall_us) const {
+    return orientation_ring_.latest_timing(utc_us, received_wall_us, pushed_wall_us);
+  }
   const PoseRing& pose_ring() const { return pose_ring_; }
   const OrientationRing& orientation_ring() const { return orientation_ring_; }
   std::string imu_status_string() const {
@@ -68,6 +83,15 @@ class StateTracker {
       if (gnss_for_fix_log->alt) os << " alt=" << *gnss_for_fix_log->alt;
       if (gnss_for_fix_log->vel) {
         os << " vel=[" << (*gnss_for_fix_log->vel)[0] << "," << (*gnss_for_fix_log->vel)[1] << "," << (*gnss_for_fix_log->vel)[2] << "]";
+      }
+      if (gnss_for_fix_log->utm_xyz) {
+        os << " utm=[" << (*gnss_for_fix_log->utm_xyz)[0] << "," << (*gnss_for_fix_log->utm_xyz)[1] << "," << (*gnss_for_fix_log->utm_xyz)[2] << "]"
+           << " utm_zone=" << gnss_for_fix_log->utm_zone
+           << (gnss_for_fix_log->utm_northp ? "N" : "S");
+      }
+      if (gnss_for_fix_log->covariance_enu_m2) {
+        const auto& cov = *gnss_for_fix_log->covariance_enu_m2;
+        os << " cov_diag_m2=[" << cov[0] << "," << cov[4] << "," << cov[8] << "]";
       }
       if (last_gnss_fix_ && last_gnss_) {
         uint64_t age_us = (last_gnss_->utc_us > last_gnss_fix_->utc_us)
@@ -122,6 +146,10 @@ class StateTracker {
     std::optional<double> lon;
     std::optional<double> alt;
     std::optional<std::array<double, 3>> vel;
+    std::optional<std::array<double, 3>> utm_xyz;
+    int utm_zone = 0;
+    bool utm_northp = true;
+    std::optional<std::array<double, 9>> covariance_enu_m2;
     uint8_t utc_valid = 0;
     int fix_type = -1;
     int num_sv = -1;
@@ -247,6 +275,19 @@ class StateTracker {
 	    return false;
 	  }
 
+  uint64_t master_to_wall_us(uint64_t master_ns) const {
+    return utc_mapper_->fallback_from_anchor(master_ns) / 1000ULL;
+  }
+
+  void notify_data_callback() {
+    std::function<void()> callback;
+    {
+      std::lock_guard<std::mutex> lk(callback_mu_);
+      callback = data_callback_;
+    }
+    if (callback) callback();
+  }
+
   void update_raw_imu_status(uint64_t utc_ns, const std::array<float, 3>& acc,
                              const std::array<float, 3>& gyro) {
     imu_count_.fetch_add(1);
@@ -268,14 +309,17 @@ class StateTracker {
   }
 
   void push_orientation(uint64_t utc_ns, uint16_t pc, const std::array<double, 3>& euler_deg,
-                        const std::array<float, 3>& acc, const std::array<float, 3>& gyro) {
+                        const std::array<float, 3>& acc, const std::array<float, 3>& gyro,
+                        uint64_t received_wall_us = 0) {
     OrientationSample sample;
     sample.utc_us = utc_ns / 1000ULL;
+    sample.received_wall_us = received_wall_us;
     sample.pc = pc;
     sample.roll_deg = euler_deg[0];
     sample.pitch_deg = euler_deg[1];
     sample.yaw_deg = euler_deg[2];
     orientation_ring_.push(sample);
+    notify_data_callback();
     imu_count_.fetch_add(1);
     orientation_count_.fetch_add(1);
     uint64_t now_ns = now_master_ns();
@@ -288,14 +332,31 @@ class StateTracker {
   void push_gnss_pose(uint64_t utc_ns, uint16_t pc,
                       std::optional<double> lat, std::optional<double> lon, std::optional<double> alt,
                       std::optional<std::array<double, 3>> vel, uint8_t utc_valid,
-                      int fix_type = -1, int num_sv = -1) {
+                      int fix_type = -1, int num_sv = -1,
+                      std::optional<std::array<double, 9>> covariance_enu_m2 = std::nullopt,
+                      uint64_t received_wall_us = 0) {
     gnss_count_.fetch_add(1);
     uint64_t now_ns = now_master_ns();
     gnss_rate_.push(now_ns);
     std::optional<double> alt_for_pose = alt;
+    std::optional<std::array<double, 9>> covariance_for_pose = covariance_enu_m2;
+    std::optional<std::array<double, 3>> utm_xyz_for_status;
+    int utm_zone_for_status = 0;
+    bool utm_northp_for_status = true;
+    if (lat && lon && alt_for_pose) {
+      UtmCoord utm{};
+      if (lla_to_utm(*lat, *lon, utm)) {
+        utm_xyz_for_status = std::array<double, 3>{utm.easting_m, utm.northing_m, *alt_for_pose};
+        utm_zone_for_status = utm.zone;
+        utm_northp_for_status = utm.northp;
+      }
+    }
     {
       std::lock_guard<std::mutex> lk(status_mu_);
-      last_gnss_ = LatestGnssStatus{utc_ns / 1000ULL, lat, lon, alt, vel, utc_valid, fix_type, num_sv};
+      last_gnss_ = LatestGnssStatus{
+          utc_ns / 1000ULL, lat, lon, alt, vel,
+          utm_xyz_for_status, utm_zone_for_status, utm_northp_for_status,
+          covariance_enu_m2, utc_valid, fix_type, num_sv};
       if (lat && lon) {
         LatestGnssStatus merged = last_gnss_fix_.value_or(LatestGnssStatus{});
         merged.utc_us = utc_ns / 1000ULL;
@@ -303,19 +364,34 @@ class StateTracker {
         merged.lon = lon;
         if (alt) merged.alt = alt;
         if (vel) merged.vel = vel;
+        if (utm_xyz_for_status) {
+          merged.utm_xyz = utm_xyz_for_status;
+          merged.utm_zone = utm_zone_for_status;
+          merged.utm_northp = utm_northp_for_status;
+        }
+        if (covariance_enu_m2) merged.covariance_enu_m2 = covariance_enu_m2;
         merged.utc_valid = utc_valid;
         if (fix_type >= 0) merged.fix_type = fix_type;
         if (num_sv >= 0) merged.num_sv = num_sv;
         last_gnss_fix_ = merged;
       }
       if (!alt_for_pose && last_gnss_fix_ && last_gnss_fix_->alt) alt_for_pose = last_gnss_fix_->alt;
+      if (!covariance_for_pose && last_gnss_fix_ && last_gnss_fix_->covariance_enu_m2) {
+        covariance_for_pose = last_gnss_fix_->covariance_enu_m2;
+      }
     }
-    if (!lat || !lon || !alt_for_pose) return;
     OrientationSample orientation{};
     uint64_t orient_err_us = 0;
     const bool have_orientation =
         orientation_ring_.nearest(utc_ns / 1000ULL, orientation, orient_err_us) && orient_err_us <= 200000ULL;
+    if (yaw_heading_logger_ && (have_orientation || vel)) {
+      yaw_heading_logger_->log_sensor(
+          utc_ns / 1000ULL, now_ns,
+          have_orientation, have_orientation ? orientation.yaw_deg : 0.0,
+          vel, fix_type, num_sv, utc_valid);
+    }
 
+    if (!lat || !lon || !alt_for_pose) return;
     const std::array<double, 3> lla{*lat, *lon, *alt_for_pose};
     const std::array<double, 3> ecef = lla_to_ecef(*lat, *lon, *alt_for_pose);
     if (!origin_lla_) {
@@ -325,9 +401,24 @@ class StateTracker {
     }
     PoseSample pose;
     pose.utc_us = utc_ns / 1000ULL;
+    pose.received_wall_us = received_wall_us;
     pose.pc = pc;
     pose.lla = lla;
     pose.enu_xyz = ecef_to_enu(ecef, *origin_lla_, origin_ecef_);
+    if (vel) {
+      pose.vel_enu_mps = *vel;
+      pose.velocity_valid = true;
+    }
+    UtmCoord utm{};
+    if (lla_to_utm(*lat, *lon, utm)) {
+      pose.utm_xyz = {utm.easting_m, utm.northing_m, *alt_for_pose};
+      pose.utm_zone = utm.zone;
+      pose.utm_northp = utm.northp;
+    }
+    if (covariance_for_pose) {
+      pose.covariance_enu_m2 = *covariance_for_pose;
+      pose.covariance_valid = true;
+    }
     if (have_orientation) {
       pose.world_from_ego = rotation_matrix_from_ypr_rad(
           orientation.yaw_deg * M_PI / 180.0,
@@ -339,11 +430,13 @@ class StateTracker {
       }
     }
     pose_ring_.push(pose);
+    notify_data_callback();
     pose_rate_.push(now_ns);
   }
 
   void process_nmea_sentence(const std::string& line, uint64_t t_rx_ns, uint16_t pc_last) {
     if (!ascii_xor_checksum_ok(line)) return;
+    const uint64_t received_wall_us = master_to_wall_us(t_rx_ns);
     size_t star = line.find('*');
     if (star == std::string::npos || star < 1) return;
     std::string body = line.substr(1, star - 1);
@@ -399,8 +492,11 @@ class StateTracker {
           yaw_deg = prior.yaw_deg;
         }
       }
-      push_orientation(utc_ns, pc_last, {0.0, 0.0, yaw_deg}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f});
-      push_gnss_pose(utc_ns, pc_last, lat, lon, std::nullopt, vel, 0x03, 1);
+      push_orientation(
+          utc_ns, pc_last, {0.0, 0.0, yaw_deg},
+          {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f},
+          received_wall_us);
+      push_gnss_pose(utc_ns, pc_last, lat, lon, std::nullopt, vel, 0x03, 1, -1, std::nullopt, received_wall_us);
       return;
     }
 
@@ -430,7 +526,7 @@ class StateTracker {
             xsens_utc_to_ns(nmea_year_, nmea_mon_, nmea_day_, hour, min, sec, nanos, utc_ns)) {
           utc_valid = 0x03;
           utc_mapper_->update(t_rx_ns, utc_ns);
-          push_gnss_pose(utc_ns, pc_last, lat, lon, alt, std::nullopt, utc_valid, fix_quality, num_sv);
+          push_gnss_pose(utc_ns, pc_last, lat, lon, alt, std::nullopt, utc_valid, fix_quality, num_sv, std::nullopt, received_wall_us);
         }
       }
     }
@@ -439,6 +535,7 @@ class StateTracker {
   void process_pppnava_sentence(const ParsedAsciiLog& log, uint64_t t_rx_ns, uint16_t pc_last) {
     if (log.body_fields.size() < 6) return;
     if (log.body_fields[0] != "SOL_COMPUTED") return;
+    const uint64_t received_wall_us = master_to_wall_us(t_rx_ns);
 
     double lat = 0.0, lon = 0.0, hgt = 0.0;
     if (!try_parse_double(log.body_fields[2], lat) ||
@@ -453,21 +550,22 @@ class StateTracker {
       if (try_parse_double(log.body_fields[5], undulation)) alt_m = hgt + undulation;
     }
 
-	    uint16_t gps_week = 0;
-	    double tow_sec = 0.0;
-	    uint64_t utc_ns = 0;
-	    uint8_t utc_valid = 0;
-	    if (parse_proprietary_header_week_tow(log.header_fields, gps_week, tow_sec) &&
-	        parse_proprietary_time_from_week_tow(gps_week, tow_sec, t_rx_ns, utc_ns, utc_valid)) {
-	      push_gnss_pose(utc_ns, pc_last, lat, lon, alt_m, std::nullopt, utc_valid, 4, -1);
-	      return;
-	    }
+    uint16_t gps_week = 0;
+    double tow_sec = 0.0;
+    uint64_t utc_ns = 0;
+    uint8_t utc_valid = 0;
+    if (parse_proprietary_header_week_tow(log.header_fields, gps_week, tow_sec) &&
+        parse_proprietary_time_from_week_tow(gps_week, tow_sec, t_rx_ns, utc_ns, utc_valid)) {
+      push_gnss_pose(utc_ns, pc_last, lat, lon, alt_m, std::nullopt, utc_valid, 4, -1, std::nullopt, received_wall_us);
+      return;
+    }
 
     parse_proprietary_time_from_week_tow(0, -1.0, t_rx_ns, utc_ns, utc_valid);
-    push_gnss_pose(utc_ns, pc_last, lat, lon, alt_m, std::nullopt, utc_valid, 4, -1);
+    push_gnss_pose(utc_ns, pc_last, lat, lon, alt_m, std::nullopt, utc_valid, 4, -1, std::nullopt, received_wall_us);
   }
 
   void process_inspva_sentence(const ParsedAsciiLog& log, uint64_t t_rx_ns, uint16_t pc_last) {
+    const uint64_t received_wall_us = master_to_wall_us(t_rx_ns);
     if (log.name == "INSPVAA" || log.name == "INSPVASA") {
       if (log.body_fields.size() < 12) return;
       uint16_t gps_week = 0;
@@ -493,8 +591,11 @@ class StateTracker {
       parse_proprietary_time_from_week_tow(gps_week, tow_sec, t_rx_ns, utc_ns, utc_valid);
       const double yaw_deg = wrap_angle_deg(90.0 - azimuth_deg);
       const double pitch_deg = -pitch_up_deg;
-      push_orientation(utc_ns, pc_last, {roll_deg, pitch_deg, yaw_deg}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f});
-      push_gnss_pose(utc_ns, pc_last, lat, lon, alt_m, std::array<double, 3>{ve, vn, vu}, utc_valid, 4, -1);
+      push_orientation(
+          utc_ns, pc_last, {roll_deg, pitch_deg, yaw_deg},
+          {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f},
+          received_wall_us);
+      push_gnss_pose(utc_ns, pc_last, lat, lon, alt_m, std::array<double, 3>{ve, vn, vu}, utc_valid, 4, -1, std::nullopt, received_wall_us);
       return;
     }
 
@@ -528,21 +629,29 @@ class StateTracker {
 
       const double yaw_deg = wrap_angle_deg(90.0 - azimuth_deg);
       const double pitch_deg = -pitch_up_deg;
-      push_orientation(utc_ns, pc_last, {roll_deg, pitch_deg, yaw_deg}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f});
-      push_gnss_pose(utc_ns, pc_last, lat, lon, hgt + undulation, std::array<double, 3>{ve, vn, vu}, utc_valid, 4, -1);
+      push_orientation(
+          utc_ns, pc_last, {roll_deg, pitch_deg, yaw_deg},
+          {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f},
+          received_wall_us);
+      push_gnss_pose(utc_ns, pc_last, lat, lon, hgt + undulation, std::array<double, 3>{ve, vn, vu}, utc_valid, 4, -1, std::nullopt, received_wall_us);
     }
   }
 
   void process_drpvaa_sentence(const ParsedAsciiLog& log, uint64_t t_rx_ns, uint16_t pc_last) {
     if (log.body_fields.size() < 28) return;
+    const uint64_t received_wall_us = master_to_wall_us(t_rx_ns);
 
     double lat = 0.0, lon = 0.0, hgt = 0.0, undulation = 0.0;
     double ve = 0.0, vn = 0.0, vu = 0.0;
     double heading_deg = 0.0, pitch_up_deg = 0.0, roll_deg = 0.0;
+    double lat_sigma_m = 0.0, lon_sigma_m = 0.0, hgt_sigma_m = 0.0;
     if (!try_parse_double(log.body_fields[9], lat) ||
         !try_parse_double(log.body_fields[10], lon) ||
         !try_parse_double(log.body_fields[11], hgt) ||
         !try_parse_double(log.body_fields[12], undulation) ||
+        !try_parse_double(log.body_fields[13], lat_sigma_m) ||
+        !try_parse_double(log.body_fields[14], lon_sigma_m) ||
+        !try_parse_double(log.body_fields[15], hgt_sigma_m) ||
         !try_parse_double(log.body_fields[19], ve) ||
         !try_parse_double(log.body_fields[20], vn) ||
         !try_parse_double(log.body_fields[21], vu) ||
@@ -564,10 +673,27 @@ class StateTracker {
 
     const double yaw_deg = wrap_angle_deg(90.0 - heading_deg);
     const double pitch_deg = -pitch_up_deg;
-    push_orientation(utc_ns, pc_last, {roll_deg, pitch_deg, yaw_deg}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f});
+    push_orientation(
+        utc_ns, pc_last, {roll_deg, pitch_deg, yaw_deg},
+        {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f},
+        received_wall_us);
 
     if (log.body_fields[0] != "INSUFFICIENT_OBS" && std::fabs(lat) > 1e-9 && std::fabs(lon) > 1e-9) {
-      push_gnss_pose(utc_ns, pc_last, lat, lon, hgt + undulation, std::array<double, 3>{ve, vn, vu}, utc_valid, 4, -1);
+      std::optional<std::array<double, 9>> covariance_enu_m2;
+      if (lat_sigma_m >= 0.0 && lon_sigma_m >= 0.0 && hgt_sigma_m >= 0.0 &&
+          std::isfinite(lat_sigma_m) && std::isfinite(lon_sigma_m) && std::isfinite(hgt_sigma_m)) {
+        // DRPVAA position standard deviations are latitude, longitude, height.
+        // Publish covariance in ENU order: east, north, up.
+        covariance_enu_m2 = std::array<double, 9>{
+            lon_sigma_m * lon_sigma_m, 0.0, 0.0,
+            0.0, lat_sigma_m * lat_sigma_m, 0.0,
+            0.0, 0.0, hgt_sigma_m * hgt_sigma_m,
+        };
+      }
+      push_gnss_pose(
+          utc_ns, pc_last, lat, lon, hgt + undulation,
+          std::array<double, 3>{ve, vn, vu}, utc_valid, 4, -1,
+          covariance_enu_m2, received_wall_us);
     }
   }
 
@@ -909,8 +1035,9 @@ class StateTracker {
           t_utc_ns = utc_mapper_->fallback_from_anchor(t_master_ns);
         }
 
+        const uint64_t received_wall_us = master_to_wall_us(t_rx_ns);
         if (got_euler) {
-          push_orientation(t_utc_ns, pc_last, euler_deg, acc, gyro);
+          push_orientation(t_utc_ns, pc_last, euler_deg, acc, gyro, received_wall_us);
         } else if (got_acc || got_gyro) {
           imu_count_.fetch_add(1);
           std::lock_guard<std::mutex> lk(status_mu_);
@@ -918,7 +1045,7 @@ class StateTracker {
         }
 
         if (got_latlon || got_alt || got_vel || got_utc || gnss_fix_type >= 0 || gnss_num_sv >= 0) {
-          push_gnss_pose(t_utc_ns, pc_last, lat, lon, alt, vel, utc_valid, gnss_fix_type, gnss_num_sv);
+          push_gnss_pose(t_utc_ns, pc_last, lat, lon, alt, vel, utc_valid, gnss_fix_type, gnss_num_sv, std::nullopt, received_wall_us);
         }
       }
     }
@@ -931,6 +1058,7 @@ class StateTracker {
   int baud_;
   UtcMapper* utc_mapper_;
   std::array<double, 3> gnss_antenna_to_ego_m_{0.0, 0.0, 0.0};
+  YawHeadingCsvLogger* yaw_heading_logger_{nullptr};
   std::atomic<bool> running_{false};
   std::atomic<bool> has_error_{false};
   std::string error_message_;
@@ -945,6 +1073,8 @@ class StateTracker {
   RecentRateTracker gnss_rate_;
   RecentRateTracker pose_rate_;
   mutable std::mutex status_mu_;
+  mutable std::mutex callback_mu_;
+  std::function<void()> data_callback_;
   std::optional<LatestImuStatus> last_imu_;
   std::optional<LatestGnssStatus> last_gnss_;
   std::optional<LatestGnssStatus> last_gnss_fix_;

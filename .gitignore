@@ -27,6 +27,8 @@
 *.tmp
 *.bak
 *.bak_*
+/portfolio_outputs/
+/yaw_heading_logs/
 
 # Python local state
 __pycache__/

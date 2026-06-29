@@ -1,5 +1,5 @@
 output_root: /workspace/datasample
-session_id: "2026-05-14-test1"
+session_id: "2026-06-24-test1"
 vehicle_id: test_car_01
 timezone: UTC
 
@@ -7,9 +7,10 @@ duration_sec: 0
 chunk_sec: 60
 
 camera_fps: 30
+record_fps: 15
 camera_width: 3840
 camera_height: 2160
-camera_bitrate: 80000000
+camera_bitrate: 40000000
 camera_container: mkv
 camera_codec: h265
 
@@ -17,17 +18,17 @@ imu_dev: "/dev/ttyUSB0"
 sensor_dump: ""
 imu_baud: 115200
 imu_hz: 100
-gnss_hz: 10
+gnss_hz: 30
 
 finalize_spool: true
 cleanup_spool: false
 validate: false
 
 camera_devices:
-  - /dev/video0
-  - /dev/video3
   - /dev/video2
-  - /dev/video1
+  - /dev/video3
+  - /dev/video4
+  - /dev/video7
   
 # Reference
 # This file is auto-loaded when you run:
@@ -62,6 +63,11 @@ camera_devices:
 #
 # camera_fps, camera_width, camera_height:
 #   Camera capture settings shared by all cameras.
+#
+# record_fps:
+#   Saved video frame rate after optional in-pipeline frame dropping.
+#   Keep camera_fps at 30 for 4K V4L2 negotiation and set record_fps to 15
+#   when recording 4K15 from cameras that only expose 4K30 capture.
 #
 # camera_bitrate:
 #   Per-camera encoder bitrate in bits/sec.

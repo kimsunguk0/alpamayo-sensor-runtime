@@ -100,6 +100,8 @@ Important raw-recorder config fields live in:
 /workspace/raw_recorder/config/raw_recorder.yaml
 ```
 
+`camera_fps` controls V4L2 capture negotiation. `record_fps` controls the saved video frame rate after optional in-pipeline frame dropping, so 4K30 capture can be recorded as 4K15 without changing the camera mode.
+
 Camera order for the raw recorder is fixed:
 
 ```text
@@ -129,6 +131,23 @@ Endpoints:
 GET /healthz  # JSON health summary
 GET /latest   # latest planner NPZ sample, or HTTP 503 if no valid sample exists
 ```
+
+Additional `/latest` GNSS/INS fields:
+
+```text
+gnss_utc_us.npy             [1], int64, UTC timestamp for the GNSS/INS pose
+gnss_lla.npy                [1, 3], float64, latitude/longitude/altitude
+gnss_utm.npy                [1, 3], float64, UTM easting/northing/altitude in meters
+gnss_utm_zone.npy           [1], int32, UTM zone number
+gnss_utm_northp.npy         [1], uint8, 1 for northern hemisphere, 0 for southern
+gnss_utm_valid.npy          [1], uint8
+gnss_covariance_enu_m2.npy  [1, 3, 3], float64, ENU covariance in m^2
+gnss_covariance_valid.npy   [1], uint8
+yaw_deg.npy                 [1], float32, INS yaw angle in degrees
+yaw_valid.npy               [1], uint8
+```
+
+Set `debug_diagnostics_enabled: true` in a live config, or pass `--debug`, to add timing diagnostics to `/healthz` and `X-Debug-*` headers on `/latest`. Set `yaw_heading_log_enabled: true` to write yaw-versus-heading CSV diagnostics under `yaw_heading_log_dir`.
 
 The live container supports 1 to 4 active cameras. `front_wide` is accepted as an alias for `front`.
 
@@ -199,6 +218,8 @@ Ignored by default:
 ```text
 datasample/
 build/
+portfolio_outputs/
+yaw_heading_logs/
 *.mkv, *.mp4, *.parquet
 *.log
 .venv*/

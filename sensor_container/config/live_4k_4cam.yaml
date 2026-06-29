@@ -26,7 +26,7 @@ camera_names:
   - left
   - right
 camera_devices:
-  - /dev/video0
-  - /dev/video3
   - /dev/video2
-  - /dev/video1
+  - /dev/video3
+  - /dev/video4
+  - /dev/video7

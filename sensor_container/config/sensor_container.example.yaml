@@ -17,6 +17,10 @@ camera_target_mismatch_us: 50000
 localization_stale_us: 100000
 camera_state_skew_us: 50000
 allow_poseless_test_mode: false
+debug_diagnostics_enabled: false
+yaw_heading_log_enabled: false
+yaw_heading_log_dir: /workspace/yaw_heading_logs
+yaw_heading_min_speed_mps: 0.2
 camera_names:
   - left
   - front

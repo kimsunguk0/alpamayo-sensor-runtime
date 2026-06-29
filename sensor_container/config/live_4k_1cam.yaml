@@ -7,12 +7,12 @@ imu_baud: 115200
 gnss_antenna_to_ego_x_m: 0.0
 gnss_antenna_to_ego_y_m: 0.0
 gnss_antenna_to_ego_z_m: 0.0
-camera_backend: v4l2
+camera_backend: v4l2_preproc
 pixel_format: UYVY
 camera_width: 3840
 camera_height: 2160
 camera_fps: 30
-planner_ingest_fps: 15
+planner_ingest_fps: 10
 planner_width: 576
 planner_height: 320
 fixed_delta_seconds: 0.1
@@ -20,7 +20,10 @@ camera_target_mismatch_us: 50000
 localization_stale_us: 400000
 camera_state_skew_us: 50000
 allow_poseless_test_mode: false
+yaw_heading_log_enabled: false
+yaw_heading_log_dir: /workspace/yaw_heading_logs
+yaw_heading_min_speed_mps: 0.2
 camera_names:
   - front_wide
 camera_devices:
-  - /dev/video0
+  - /dev/video2

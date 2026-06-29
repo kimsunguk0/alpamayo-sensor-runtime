@@ -6,9 +6,10 @@
 
 static void print_usage() {
   std::cout
-      << "Usage: /workspace/alpamayo_sensor_container [--config PATH] [--port N]\n"
+      << "Usage: /workspace/alpamayo_sensor_container [--config PATH] [--port N] [--debug]\n"
       << "  /latest  : latest valid planner NPZ sample or 503\n"
-      << "  /healthz : minimal JSON health summary\n";
+      << "  /healthz : minimal JSON health summary\n"
+      << "  --debug  : include latency diagnostics in /latest headers and /healthz\n";
 }
 
 int main(int argc, char** argv) {
@@ -19,6 +20,7 @@ int main(int argc, char** argv) {
   SensorContainerConfig cfg = default_config();
   fs::path config_path = "/workspace/sensor_container/config/sensor_container.example.yaml";
   bool use_config = true;
+  bool cli_debug_requested = false;
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -33,6 +35,8 @@ int main(int argc, char** argv) {
       cfg.bind_port = std::atoi(argv[++i]);
     } else if (a == "--clip-id" && i + 1 < argc) {
       cfg.clip_id = argv[++i];
+    } else if (a == "--debug") {
+      cli_debug_requested = true;
     } else {
       std::cerr << "Unknown arg: " << a << "\n";
       print_usage();
@@ -48,12 +52,34 @@ int main(int argc, char** argv) {
     }
     log_info("loaded config: " + config_path.string());
   }
+  if (cli_debug_requested) {
+    cfg.debug_diagnostics_enabled = true;
+  }
 
   TimeAnchors anchors;
   UtcMapper utc_mapper(anchors);
+  YawHeadingCsvLogger yaw_heading_logger;
+  YawHeadingCsvLogger* yaw_heading_logger_ptr = nullptr;
+  if (cfg.yaw_heading_log_enabled) {
+    std::string log_error_message;
+    if (!yaw_heading_logger.open(
+            cfg.yaw_heading_log_dir, cfg.clip_id, cfg.yaw_heading_min_speed_mps,
+            log_error_message)) {
+      log_error(log_error_message);
+      return 1;
+    }
+    yaw_heading_logger_ptr = &yaw_heading_logger;
+    log_ready("yaw/heading CSV logging enabled: sensor=" +
+              yaw_heading_logger.sensor_path().string() +
+              " planner=" + yaw_heading_logger.planner_path().string());
+  }
+  if (cfg.debug_diagnostics_enabled) {
+    log_ready("debug latency diagnostics enabled");
+  }
   StateTracker state(
       cfg.imu_dev, cfg.imu_baud, &utc_mapper,
-      {cfg.gnss_antenna_to_ego_x_m, cfg.gnss_antenna_to_ego_y_m, cfg.gnss_antenna_to_ego_z_m});
+      {cfg.gnss_antenna_to_ego_x_m, cfg.gnss_antenna_to_ego_y_m, cfg.gnss_antenna_to_ego_z_m},
+      yaw_heading_logger_ptr);
   if (!state.start()) {
     log_error("failed to start state tracker");
     return 1;
@@ -71,7 +97,11 @@ int main(int argc, char** argv) {
   }
 
   LatestSampleStore latest_store;
-  SampleBuilder builder(cfg, cameras, &state, &latest_store);
+  SampleBuilder builder(cfg, cameras, &state, &latest_store, yaw_heading_logger_ptr);
+  state.set_data_callback([&builder]() { builder.notify_data_available(); });
+  for (auto& cam : cameras) {
+    cam->set_frame_callback([&builder]() { builder.notify_data_available(); });
+  }
   builder.start();
 
   HttpServer server(cfg, &cameras, &state, &latest_store);
